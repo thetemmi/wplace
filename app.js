@@ -60,6 +60,9 @@ function processImage({img, width, dither, metric, orderedStrength}){
   const imgData = rctx.getImageData(0,0,dstW,dstH);
   const data = imgData.data;
 
+  // Попередня обробка: насиченість + контраст (пом'якшення результату)
+  applySaturationContrast(data);
+
   if(dither==="None"){
     for(let i=0;i<data.length;i+=4){
       const [nr,ng,nb] = nearestPaletteColor([data[i],data[i+1],data[i+2]], metric);
@@ -69,6 +72,44 @@ function processImage({img, width, dither, metric, orderedStrength}){
   }
 
   if(dither==="Ordered (8x8)"){
+  if(dither==="Ordered (4x4)"){
+    const jit = orderedStrength*32;
+    for(let y=0;y<dstH;y++) for(let x=0;x<dstW;x++){
+      const i=(y*dstW+x)*4, t=BAYER_4[y%4][x%4]-0.5;
+      const rr=clamp255(data[i]+t*jit), gg=clamp255(data[i+1]+t*jit), bb=clamp255(data[i+2]+t*jit);
+      const [nr,ng,nb]=nearestPaletteColor([rr,gg,bb], metric);
+      data[i]=nr; data[i+1]=ng; data[i+2]=nb; data[i+3]=255;
+    }
+    rctx.putImageData(imgData,0,0); return resize;
+  }
+
+  if(dither==="Random"){
+    // Додаємо шум перед квантизацією, сила використовує orderedStrength
+    const amp = orderedStrength*48;
+    let seed = 2463534242>>>0;
+    const rnd = ()=>{ seed ^= seed<<13; seed ^= seed>>>17; seed ^= seed<<5; return (seed>>>0)/0xFFFFFFFF; };
+    for(let y=0;y<dstH;y++) for(let x=0;x<dstW;x++){
+      const i=(y*dstW+x)*4;
+      const rr=clamp255(data[i]  + (rnd()-0.5)*2*amp);
+      const gg=clamp255(data[i+1]+ (rnd()-0.5)*2*amp);
+      const bb=clamp255(data[i+2]+ (rnd()-0.5)*2*amp);
+      const [nr,ng,nb]=nearestPaletteColor([rr,gg,bb], metric);
+      data[i]=nr; data[i+1]=ng; data[i+2]=nb; data[i+3]=255;
+    }
+    rctx.putImageData(imgData,0,0); return resize;
+  }
+
+  if(dither==="Blue Noise"){
+    const amp = orderedStrength*64;
+    for(let y=0;y<dstH;y++) for(let x=0;x<dstW;x++){
+      const i=(y*dstW+x)*4, t=BLUENOISE_16[y%16][x%16]-0.5;
+      const rr=clamp255(data[i]+t*amp), gg=clamp255(data[i+1]+t*amp), bb=clamp255(data[i+2]+t*amp);
+      const [nr,ng,nb]=nearestPaletteColor([rr,gg,bb], metric);
+      data[i]=nr; data[i+1]=ng; data[i+2]=nb; data[i+3]=255;
+    }
+    rctx.putImageData(imgData,0,0); return resize;
+  }
+
     // Розширена сила до 3.0
     const jit = orderedStrength*64;
     for(let y=0;y<dstH;y++) for(let x=0;x<dstW;x++){
@@ -108,6 +149,8 @@ function processImage({img, width, dither, metric, orderedStrength}){
       } else if(dither==="Atkinson"){
         const n=1/8; const add=(xx,yy)=>{ if(xx>=0&&xx<dstW&&yy>=0&&yy<dstH){ const t=idx(xx,yy); buf[t]+=er*n; buf[t+1]+=eg*n; buf[t+2]+=eb*n; } };
         add(x+1,y); add(x+2,y); add(x-1,y+1); add(x,y+1); add(x+1,y+1); add(x,y+2);
+      } else if (KERNELS[dither]) {
+        diffuseKernel(buf, dstW, dstH, x, y, er, eg, eb, KERNELS[dither]);
       }
     }
   }
@@ -206,7 +249,7 @@ drop.addEventListener('drop', e=>{ e.preventDefault(); const f=e.dataTransfer.fi
 fileI.addEventListener('change', e=>{ const f=e.target.files?.[0]; if(f){ const url=URL.createObjectURL(f); setImageURL(url); }});
 urlI.addEventListener('change', e=> setImageURL(e.target.value.trim()));
 
-ditherSel.addEventListener('change', ()=>{ orderedWrap.classList.toggle('hidden', ditherSel.value!=="Ordered (8x8)"); });
+ditherSel.addEventListener('change', ()=>{ const v=ditherSel.value; const show = (v==="Ordered (8x8)"||v==="Ordered (4x4)"||v==="Random"||v==="Blue Noise"); orderedWrap.classList.toggle('hidden', !show); });
 orderedR.addEventListener('input', ()=> orderedVal.textContent = (+orderedR.value).toFixed(2));
 wRange.addEventListener('input', ()=> wVal.textContent = wRange.value);
 scaleR.addEventListener('input', ()=>{ pixelScale = +scaleR.value; scaleVal.textContent = pixelScale; if(outC._resultCanvas) renderScaled(outC._resultCanvas); });
@@ -224,3 +267,94 @@ saveBtn.addEventListener('click', downloadPNG);
     wrap.appendChild(box); wrap.appendChild(cap); pal.appendChild(wrap);
   });
 })();
+
+// ========= ДОДАТКОВІ ЯДРА ДИЗЕРИНГУ =========
+const KERNELS = {
+  // формат: масив об'єктів {dx, dy, w}, сума ваг = нормалізатор
+  "Burkes": [
+    {dx:1,dy:0,w:8/32},{dx:2,dy:0,w:4/32},
+    {dx:-2,dy:1,w:2/32},{dx:-1,dy:1,w:4/32},{dx:0,dy:1,w:8/32},{dx:1,dy:1,w:4/32},{dx:2,dy:1,w:2/32}
+  ],
+  "Stucki": [
+    {dx:1,dy:0,w:8/42},{dx:2,dy:0,w:4/42},
+    {dx:-2,dy:1,w:2/42},{dx:-1,dy:1,w:4/42},{dx:0,dy:1,w:8/42},{dx:1,dy:1,w:4/42},{dx:2,dy:1,w:2/42},
+    {dx:-2,dy:2,w:1/42},{dx:-1,dy:2,w:2/42},{dx:0,dy:2,w:4/42},{dx:1,dy:2,w:2/42},{dx:2,dy:2,w:1/42}
+  ],
+  "Jarvis–Judice–Ninke": [
+    {dx:1,dy:0,w:7/48},{dx:2,dy:0,w:5/48},
+    {dx:-2,dy:1,w:3/48},{dx:-1,dy:1,w:5/48},{dx:0,dy:1,w:7/48},{dx:1,dy:1,w:5/48},{dx:2,dy:1,w:3/48},
+    {dx:-2,dy:2,w:1/48},{dx:-1,dy:2,w:3/48},{dx:0,dy:2,w:5/48},{dx:1,dy:2,w:3/48},{dx:2,dy:2,w:1/48}
+  ],
+  "Sierra Lite": [
+    {dx:1,dy:0,w:2/4},
+    {dx:-1,dy:1,w:1/4},{dx:0,dy:1,w:1/4}
+  ],
+  "Sierra 2-4A": [
+    {dx:1,dy:0,w:4/32},{dx:2,dy:0,w:3/32},
+    {dx:-2,dy:1,w:1/32},{dx:-1,dy:1,w:2/32},{dx:0,dy:1,w:3/32},{dx:1,dy:1,w:2/32},{dx:2,dy:1,w:1/32},
+    {dx:-1,dy:2,w:1/32},{dx:0,dy:2,w:2/32},{dx:1,dy:2,w:1/32}
+  ],
+  "Sierra 3": [
+    {dx:1,dy:0,w:5/32},{dx:2,dy:0,w:3/32},
+    {dx:-2,dy:1,w:2/32},{dx:-1,dy:1,w:4/32},{dx:0,dy:1,w:5/32},{dx:1,dy:1,w:4/32},{dx:2,dy:1,w:2/32},
+    {dx:-2,dy:2,w:2/32},{dx:-1,dy:2,w:3/32},{dx:0,dy:2,w:4/32},{dx:1,dy:2,w:3/32},{dx:2,dy:2,w:2/32}
+  ]
+};
+
+// 4x4 Bayer
+const BAYER_4 = [
+  [0,8,2,10],
+  [12,4,14,6],
+  [3,11,1,9],
+  [15,7,13,5],
+].map(r=>r.map(v=>v/16));
+
+// Псевдо-блакитний шум: 16x16 статична мапа (наближено)
+const BLUENOISE_16 = (()=>{
+  // Використаємо детермінований генератор для стабільного «шуму»
+  const N=16, a=new Array(N).fill(0).map(()=>new Array(N).fill(0));
+  let seed = 123456789;
+  const rng = ()=>{ seed = (1103515245*seed + 12345) >>> 0; return (seed/0xFFFFFFFF); };
+  for(let y=0;y<N;y++) for(let x=0;x<N;x++){ a[y][x] = rng(); }
+  return a;
+})();
+
+// ========= Допоміжні ф-ї =========
+function applySaturationContrast(data){
+  const sat = +document.getElementById('saturation').value;
+  const ctr = +document.getElementById('contrast').value;
+  for(let i=0;i<data.length;i+=4){
+    // Контраст (навколо 128)
+    let r = (data[i]-128)*ctr + 128;
+    let g = (data[i+1]-128)*ctr + 128;
+    let b = (data[i+2]-128)*ctr + 128;
+    // Насиченість: відтінок/яскравість за Y, тягнемо до/від сірого
+    const Y = 0.2126*r + 0.7152*g + 0.0722*b;
+    r = Y + (r - Y)*sat;
+    g = Y + (g - Y)*sat;
+    b = Y + (b - Y)*sat;
+    data[i]=clamp255(r); data[i+1]=clamp255(g); data[i+2]=clamp255(b); // альфу не чіпаємо тут
+  }
+}
+
+// Узагальнена дифузія помилки по ядру
+function diffuseKernel(buf, dstW, dstH, x, y, er, eg, eb, kernel){
+  const idx=(xx,yy)=> (yy*dstW+xx)*3;
+  for(const t of kernel){
+    const xx = x + t.dx, yy = y + t.dy;
+    if(xx>=0 && xx<dstW && yy>=0 && yy<dstH){
+      const k = idx(xx,yy);
+      buf[k]   += er * t.w;
+      buf[k+1] += eg * t.w;
+      buf[k+2] += eb * t.w;
+    }
+  }
+}
+
+// ========= Додаткові UI-події =========
+document.getElementById('saturation').addEventListener('input', ()=>{
+  document.getElementById('satVal').textContent = (+document.getElementById('saturation').value).toFixed(2);
+});
+document.getElementById('contrast').addEventListener('input', ()=>{
+  document.getElementById('ctrVal').textContent = (+document.getElementById('contrast').value).toFixed(2);
+});
